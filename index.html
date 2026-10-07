@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>모래 글씨</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #c9a877; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  canvas.shake { animation: shake .5s ease-in-out; }
+  @keyframes shake {
+    0%,100% { transform: translate(0,0); } 20% { transform: translate(-6px,2px); }
+    40% { transform: translate(5px,-3px); } 60% { transform: translate(-4px,-1px); } 80% { transform: translate(3px,2px); }
+  }
+  .ui {
+    position: fixed; left: 16px; bottom: 16px; max-width: calc(100vw - 32px); box-sizing: border-box;
+    display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
+    font: 13px/1 system-ui, -apple-system, sans-serif; color: #4a3620;
+    background: rgba(255, 246, 228, .6); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    padding: 8px 10px; border-radius: 20px; box-shadow: 0 2px 12px rgba(60, 40, 10, .15);
+    user-select: none;
+  }
+  .ui label { display: flex; gap: 8px; align-items: center; }
+  .ui input[type=range] { width: 90px; accent-color: #8a6231; }
+  .ui input[type=text] {
+    width: 64px; font: inherit; color: inherit; background: rgba(255, 255, 255, .5);
+    border: 1px solid rgba(138, 98, 49, .35); border-radius: 8px; padding: 5px 6px;
+  }
+  .ui button {
+    font: inherit; color: #fff8ec; background: #8a6231; border: 0; border-radius: 999px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  .ui button:hover { background: #74501f; }
+  .seg { display: flex; background: rgba(138, 98, 49, .18); border-radius: 999px; padding: 2px; }
+  .seg button { background: transparent; color: #6b4b24; }
+  .seg button:hover { background: rgba(138, 98, 49, .2); }
+  .seg button.on { background: #8a6231; color: #fff8ec; }
+  .hint {
+    position: fixed; top: 18px; left: 16px; right: 16px; text-align: center; pointer-events: none;
+    font: 14px system-ui, -apple-system, sans-serif; color: rgba(74, 54, 32, .6); transition: opacity 1s;
+  }
+  #blade {
+    position: fixed; left: 0; top: 0; height: 4px; border-radius: 2px; pointer-events: none;
+    background: rgba(70, 45, 20, .35); box-shadow: 0 0 0 1px rgba(255, 245, 225, .35); display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="blade"></div>
+<div class="hint" id="hint">손가락(1)으로 쓰고, 고르개(2)로 쓸어 평평하게 · R 초기화 · N 새 지형</div>
+<div class="ui">
+  <div class="seg">
+    <button data-tool="finger" class="on">손가락</button>
+    <button data-tool="rake">고르개</button>
+  </div>
+  <label>크기 <input id="size" type="range" min="4" max="20" value="9"></label>
+  <button id="reset">초기화</button>
+  <button id="newseed">새 지형</button>
+  <label>시드 <input id="seed" type="text" inputmode="numeric"></label>
+  <button id="save">저장</button>
+</div>
+<script>
+'use strict';
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false });
+if (!gl) document.body.innerHTML = '<p style="padding:20px">이 브라우저는 WebGL2를 지원하지 않습니다.</p>';
+
+// ---------- 높이맵 (1 셀 = 1 CSS px, 높이 단위도 셀) ----------
+// hb: 고르개가 맞추는 기준면(완만한 기복만), hInit: 시드로 만든 거친 초기 지형, c: 다져짐(0 거침 ~ 255 매끈)
+let W, H, h, hb, hInit, thr, c, visit;
+let R = 9;                 // 손가락 반지름(셀). 고르개 날 반폭은 R*5
+let tool = 'finger';
+const REPOSE = 1.0;        // 안식각 기울기 한계
+let seed = 1, SEEDH = 0;
+
+function hashInt(x, y) {
+  let n = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + SEEDH) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return (n ^ (n >>> 16)) >>> 0;
+}
+function hash2(x, y) { return hashInt(x, y) / 4294967295; }
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, oct) {
+  let s = 0, amp = 0.5, f = 1;
+  for (let o = 0; o < oct; o++) { s += amp * vnoise(x * f, y * f); f *= 2.03; amp *= 0.5; }
+  return s;
+}
+function mulberry32(a) {
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// 알갱이 덩어리: 지터 격자 위의 둥근 혹들 중 가장 높은 것 (셀룰러 노이즈)
+function lumps(x, y, S, salt) {
+  const gx = Math.floor(x / S), gy = Math.floor(y / S);
+  let best = 0;
+  for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) {
+    const cx = gx + k, cy = gy + j, n = hashInt(cx + salt, cy - salt);
+    const px = (cx + (n & 1023) / 1023) * S, py = (cy + ((n >>> 10) & 1023) / 1023) * S;
+    const r = S * (0.5 + 0.6 * ((n >>> 20) & 1023) / 1023);
+    const dx = x - px, dy = y - py, q = (dx * dx + dy * dy) / (r * r);
+    if (q < 1) {
+      const v = (0.45 + 0.55 * (hashInt(cx, cy + salt) & 255) / 255) * Math.sqrt(1 - q);
+      if (v > best) best = v;
+    }
+  }
+  return best;
+}
+
+function genTerrain() {
+  W = window.innerWidth; H = window.innerHeight;
+  const N = W * H;
+  h = new Float32Array(N); hb = new Float32Array(N); hInit = new Float32Array(N); thr = new Float32Array(N);
+  c = new Uint8Array(N); visit = new Uint32Array(N);
+  SEEDH = Math.imul(seed, 2246822519) | 0;
+  // 1) 수십 cm 기복 + 수 cm 흐트러짐 + 알갱이 덩어리
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    hb[i] = 6 * fbm(x / 320, y / 320, 3);
+    const mid = (fbm(x / 26 + 50, y / 26, 3) - 0.47) * 2.2
+      + 0.5 * (0.25 - Math.abs(vnoise(x / 11 + 90, y / 11) - 0.5));
+    const fine = 0.85 * lumps(x, y, 5, 11) + 0.4 * lumps(x, y, 2.5, 23) + 0.08 * (hash2(x, y) - 0.5);
+    hInit[i] = hb[i] + mid + fine;
+    thr[i] = REPOSE * (0.45 + 0.8 * vnoise(x / 3 + 500, y / 3) + 0.25 * hash2(x + 999, y));
+  }
+  // 2) 흐트러진 자국: 긁힌 홈(끝에 밀린 모래)과 흙덩이
+  const rnd = mulberry32(seed ^ 0x9e3779b9);
+  const nG = Math.round(N / 9000), nC = Math.round(N / 5000);
+  for (let g = 0; g < nG; g++) {
+    // 넓고 얕게 휜 긁힘: 폭·깊이를 노이즈로 흔들어 직선 막대처럼 보이지 않게
+    const gx = rnd() * W, gy = rnd() * H, ang = rnd() * Math.PI * 2, bend = (rnd() - 0.5) * 0.05;
+    const len = 14 + rnd() * 28, wid = 5 + rnd() * 9, dep = 0.5 + rnd() * 0.7, salt = g * 13 + 7;
+    const ca = Math.cos(ang), sa = Math.sin(ang), ext = len / 2 + wid * 3;
+    for (let y = Math.max(0, Math.floor(gy - ext)); y <= Math.min(H - 1, gy + ext); y++)
+      for (let x = Math.max(0, Math.floor(gx - ext)); x <= Math.min(W - 1, gx + ext); x++) {
+        const ox = x - gx, oy = y - gy, u = ox * ca + oy * sa;
+        const v = -ox * sa + oy * ca - bend * u * u;
+        const along = Math.abs(u) / (len / 2);
+        if (along > 1.4) continue;
+        const wN = wid * (0.7 + 0.6 * vnoise(u / 6 + salt, v / 5 + salt));
+        const dN = dep * (0.5 + 0.9 * vnoise(u / 9 - salt, salt));
+        const av = Math.abs(v) / wN;
+        const endT = along < 0.5 ? 1 : Math.max(0, 1 - (along - 0.5) / 0.9);
+        let dz = 0;
+        if (av < 1) dz -= dN * (1 - av * av) * (1 - av * av) * endT;
+        const rr = (av - 1.15) / 0.45; dz += dN * 0.3 * Math.exp(-rr * rr) * endT;
+        const pu = (u - len / 2) / (wid * 0.8), pv = v / wid, pq = pu * pu + pv * pv;
+        if (pq < 1) dz += dep * 0.45 * (1 - pq) * (0.6 + 0.8 * vnoise(x / 3, y / 3));
+        hInit[y * W + x] += dz;
+      }
+  }
+  for (let k = 0; k < nC; k++) {
+    const gx = rnd() * W, gy = rnd() * H, rad = 2 + rnd() * 4, amp = 0.5 + rnd() * 0.7;
+    for (let y = Math.max(0, Math.floor(gy - rad)); y <= Math.min(H - 1, gy + rad); y++)
+      for (let x = Math.max(0, Math.floor(gx - rad)); x <= Math.min(W - 1, gx + rad); x++) {
+        const q = ((x - gx) ** 2 + (y - gy) ** 2) / (rad * rad);
+        if (q < 1) hInit[y * W + x] += amp * Math.sqrt(1 - q);
+      }
+  }
+  // 3) 기준면은 거친 요철의 평균보다 살짝 아래: 고르면 다져져 내려앉고, 남는 모래가 둔덕이 된다
+  let mean = 0;
+  for (let i = 0; i < N; i++) mean += hInit[i] - hb[i];
+  mean /= N;
+  for (let i = 0; i < N; i++) hb[i] += mean - 0.35;
+  h.set(hInit);
+}
+
+// ---------- 손가락 도장: 파낸 모래를 옆·앞으로 밀어낸다 ----------
+let scratch = new Float32Array(4096);
+function stamp(cx, cy, dx, dy) {
+  const r = R, depth = R * 0.7, outer = r * 2.3;
+  const x0 = Math.max(1, Math.floor(cx - outer)), x1 = Math.min(W - 2, Math.ceil(cx + outer));
+  const y0 = Math.max(1, Math.floor(cy - outer)), y1 = Math.min(H - 2, Math.ceil(cy + outer));
+  if (x0 > x1 || y0 > y1) return;
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  if (scratch.length < bw * bh) scratch = new Float32Array(bw * bh * 2);
+  const moving = dx !== 0 || dy !== 0;
+  let removed = 0, sumW = 0;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const ox = x - cx, oy = y - cy, d = Math.sqrt(ox * ox + oy * oy), i = y * W + x;
+    let w = 0;
+    if (d < r) {
+      const t = d / r;
+      const bump = (vnoise(x / 2.5 + cx * 0.05, y / 2.5) - 0.5) * depth * 0.35;   // 울퉁불퉁한 바닥
+      const target = hb[i] - depth * Math.sqrt(1 - t * t) + bump * (1 - t * 0.5);
+      const ex = h[i] - target;
+      if (ex > 0) { h[i] -= ex; removed += ex; }
+      c[i] = 0;
+    }
+    if (d > r * 0.8 && d < outer) {
+      const g = (d - r * 1.15) / (r * 0.38);
+      w = Math.exp(-g * g);
+      if (moving && d > 0) {
+        const along = (ox * dx + oy * dy) / d;          // +1 = 진행 방향 앞
+        w *= Math.max(0, Math.min(1.6, 0.55 + along * 1.4));
+      }
+      w *= 0.1 + 1.8 * vnoise(x / 2.2 + ((cx * 7) | 0) * 0.37, y / 2.2 + ((cy * 3) | 0) * 0.29);   // 뭉텅이 지터
+      if (w > 0.05) c[i] = 0;
+    }
+    scratch[(y - y0) * bw + (x - x0)] = w; sumW += w;
+  }
+  if (removed > 0 && sumW > 0) {
+    const k = removed / sumW;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const w = scratch[(y - y0) * bw + (x - x0)];
+      if (w > 0) h[y * W + x] += w * k;
+    }
+  }
+  unionRect('dirty', x0, y0, x1, y1);
+}
+
+// ---------- 고르개: 날이 지나간 자리를 기준면에 맞추고, 긁어낸 모래는 날 앞 둔덕으로 ----------
+const KEEP = 0.22;          // 한 번 쓸 때 남는 요철 비율 (1회 22%, 2회 5%, 3회 1%)
+const BLADE_T = 2.2;        // 날 두께(셀)
+let strokeId = 0, load = 0;
+const pileIdx = [], pileAmt = [], pileC = [];
+const spillIdx = [], spillW = [];
+
+function removePile() {
+  for (let k = 0; k < pileIdx.length; k++) { h[pileIdx[k]] -= pileAmt[k]; c[pileIdx[k]] = pileC[k]; }
+  pileIdx.length = pileAmt.length = pileC.length = 0;
+}
+function pileLen(B) { return Math.min(B * 0.8, Math.max(2.5, Math.sqrt(load / (2 * B * 0.3)))); }
+
+function bladeStep(cx, cy, dx, dy) {
+  const B = R * 5, nx = -dy, ny = dx;
+  removePile();
+  const ext = B + 6;
+  const x0 = Math.max(1, Math.floor(cx - ext)), x1 = Math.min(W - 2, Math.ceil(cx + ext));
+  const y0 = Math.max(1, Math.floor(cy - ext)), y1 = Math.min(H - 2, Math.ceil(cy + ext));
+  spillIdx.length = spillW.length = 0;
+  let spillSum = 0;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const ox = x - cx, oy = y - cy, a = ox * dx + oy * dy;
+    if (a > 0.5 || a < -BLADE_T) continue;
+    const s = Math.abs(ox * nx + oy * ny), i = y * W + x;
+    const Be = B - 4 * vnoise(x / 5, y / 5);    // 날 끝 경계를 들쭉날쭉하게
+    if (s <= Be) {
+      if (visit[i] === strokeId) continue;     // 한 번 쓸 때 한 셀은 한 번만
+      visit[i] = strokeId;
+      const edge = s > Be - 6 ? ((Be - s) / 6) ** 0.7 : 1;
+      const keep = 1 - (1 - KEEP) * edge;
+      const d = h[i] - hb[i];
+      if (d > 0) { const nd = d * keep; load += d - nd; h[i] = hb[i] + nd; }
+      else { const f = Math.min(-d * (1 - keep), load); h[i] += f; load -= f; }
+      c[i] = 255 - (255 - c[i]) * (1 - 0.65 * edge);
+    } else if (s <= B + 5) {
+      const w = Math.exp(-((s - B - 2) ** 2) / 3) * (0.3 + vnoise(x / 2, y / 2));
+      spillIdx.push(i); spillW.push(w); spillSum += w;
+    }
+  }
+  // 날 양 끝으로 조금씩 새어 나가 쓴 길 가장자리에 둑이 생긴다
+  if (load > 0 && spillSum > 0) {
+    const leak = load * 0.012, k = leak / spillSum;
+    for (let j = 0; j < spillIdx.length; j++) { h[spillIdx[j]] += spillW[j] * k; c[spillIdx[j]] = 0; }
+    load -= leak;
+  }
+  // 날 앞 둔덕 (매 걸음 지웠다 다시 쌓아 날을 따라온다)
+  if (load > 0.01) {
+    const P = pileLen(B), pe = B * 1.15 + P + 2;
+    const px0 = Math.max(1, Math.floor(cx - pe)), px1 = Math.min(W - 2, Math.ceil(cx + pe));
+    const py0 = Math.max(1, Math.floor(cy - pe)), py1 = Math.min(H - 2, Math.ceil(cy + pe));
+    let sum = 0;
+    for (let y = py0; y <= py1; y++) for (let x = px0; x <= px1; x++) {
+      const ox = x - cx, oy = y - cy, s = Math.abs(ox * nx + oy * ny);
+      const a2 = ox * dx + oy * dy - 0.5 + Math.max(0, s - B * 0.9) * 0.8;   // 끝은 뒤로 휘어 감싼다
+      if (a2 <= 0 || a2 > P) continue;
+      const e = s < B * 0.9 ? 1 : Math.max(0, 1 - (s - B * 0.9) / (B * 0.25));
+      if (e <= 0) continue;
+      const u = a2 / P, w = (1 - u) * (0.6 + 1.4 * u) * e * (0.7 + 0.6 * vnoise(x / 2.2, y / 2.2));
+      pileIdx.push(y * W + x); pileAmt.push(w); sum += w;
+    }
+    const k = sum > 0 ? load / sum : 0;
+    for (let j = 0; j < pileIdx.length; j++) {
+      const i = pileIdx[j]; pileAmt[j] *= k; h[i] += pileAmt[j]; pileC.push(c[i]); c[i] = 0;
+    }
+    unionRect('dirty', px0, py0, px1, py1);
+  }
+  unionRect('dirty', x0, y0, x1, y1);
+}
+function finishBlade(cx, cy) {
+  const B = R * 5, e = B * 1.2 + pileLen(B) + 4;
+  pileIdx.length = pileAmt.length = pileC.length = 0;   // 둔덕은 그 자리에 남긴다
+  load = 0;
+  const rc = { x0: Math.floor(cx - e), y0: Math.floor(cy - e), x1: Math.ceil(cx + e), y1: Math.ceil(cy + e) };
+  relax(rc, 3);
+  unionRect('dirty', rc.x0, rc.y0, rc.x1 + 1, rc.y1 + 1);
+}
+
+// ---------- 안식각 이완: 너무 가파른 경사는 무너진다 ----------
+function relax(rc, iters) {
+  const xa = Math.max(0, rc.x0), xb = Math.min(W - 2, rc.x1), ya = Math.max(0, rc.y0), yb = Math.min(H - 2, rc.y1);
+  for (let it = 0; it < iters; it++) {
+    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) {
+      const i = y * W + x, t = thr[i];
+      let j = i + 1, d = h[i] - h[j], m;
+      if (d > t) { m = (d - t) * 0.3; h[i] -= m; h[j] += m; } else if (d < -t) { m = (-d - t) * 0.3; h[i] += m; h[j] -= m; }
+      j = i + W; d = h[i] - h[j];
+      if (d > t) { m = (d - t) * 0.3; h[i] -= m; h[j] += m; } else if (d < -t) { m = (-d - t) * 0.3; h[i] += m; h[j] -= m; }
+    }
+  }
+}
+
+// 도장 주변만 이완. 이동 거리 기준으로 호출해서 속도와 무관하게, 손을 뗀 뒤에도 같은 모양이 되게 한다.
+function relaxAround(cx, cy, iters) {
+  const e = R * 2.3 + 3;
+  const rc = { x0: Math.floor(cx - e), y0: Math.floor(cy - e), x1: Math.ceil(cx + e), y1: Math.ceil(cy + e) };
+  relax(rc, iters);
+  unionRect('dirty', rc.x0, rc.y0, rc.x1 + 1, rc.y1 + 1);
+}
+
+const rects = { dirty: null };
+let flatFrames = 0;
+function unionRect(name, x0, y0, x1, y1) {
+  x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(W - 1, x1); y1 = Math.min(H - 1, y1);
+  const r = rects[name];
+  if (!r) rects[name] = { x0, y0, x1, y1 };
+  else { r.x0 = Math.min(r.x0, x0); r.y0 = Math.min(r.y0, y0); r.x1 = Math.max(r.x1, x1); r.y1 = Math.max(r.y1, y1); }
+}
+
+// ---------- WebGL 렌더링 ----------
+const VS = `#version 300 es
+in vec2 a; out vec2 vUv;
+void main(){ vUv = vec2(a.x*.5+.5, .5-a.y*.5); gl_Position = vec4(a,0.,1.); }`;
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uH, uHb, uC;
+uniform vec2 uTexel;
+uniform float uGrain;
+in vec2 vUv; out vec4 o;
+float Hs(vec2 p){ return texture(uH, p).r; }
+float hash(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+void main(){
+  vec2 uv = vUv;
+  float h = Hs(uv);
+  float hx = Hs(uv+vec2(uTexel.x,0.)) - Hs(uv-vec2(uTexel.x,0.));
+  float hy = Hs(uv+vec2(0.,uTexel.y)) - Hs(uv-vec2(0.,uTexel.y));
+  float cp = texture(uC, uv).r;            // 다져짐 0~1
+  float hb = texture(uHb, uv).r;
+  vec2 gp = floor(gl_FragCoord.xy / uGrain);
+  float g1 = hash(gp), g2 = hash(gp+17.3), g3 = hash(gp+91.7), g4 = hash(floor(gp*.5)+5.1);
+  float gr = mix(.24, .04, cp);            // 쓴 면은 알갱이 요철이 거의 안 보이게
+  vec3 n = normalize(vec3(-hx*.5 + (g1-.5)*gr, -hy*.5 + (g2-.5)*gr, 1.));
+  vec3 L = normalize(vec3(-.65, -.55, .45));
+  float diff = max(dot(n, L), 0.);
+
+  // 높이맵 레이마칭 그림자
+  vec2 dir = normalize(L.xy); float rise = L.z / length(L.xy);
+  float occ = 0.;
+  for (int i = 1; i <= 18; i++) {
+    float s = float(i) * 1.4;
+    occ = max(occ, Hs(uv + dir*uTexel*s) - (h + rise*s));
+  }
+  float shadow = 1. - smoothstep(0., .5, occ) * .75;
+
+  // 오목한 곳 어둡게: 넓은 캐비티 + 알갱이 틈
+  float avg = 0.;
+  for (int k = 0; k < 8; k++) {
+    float a = float(k) * .7854;
+    avg += Hs(uv + vec2(cos(a), sin(a)) * uTexel * 5.);
+  }
+  float cav = clamp((h - avg/8.) * .22, -.3, .15);
+  float avg2 = Hs(uv+vec2(uTexel.x*1.5,0.)) + Hs(uv-vec2(uTexel.x*1.5,0.)) + Hs(uv+vec2(0.,uTexel.y*1.5)) + Hs(uv-vec2(0.,uTexel.y*1.5));
+  float cav2 = clamp((h - avg2*.25) * .6, -.22, .1) * (1. - cp*.7);
+
+  vec3 sand = vec3(.85, .72, .53);
+  sand *= 1. - clamp(hb - h - 1.2, 0., 5.) * .03;                          // 눌린 바닥은 조금 진하게
+  sand = mix(sand, vec3(.93, .83, .66), clamp(h - hb - 1.5, 0., 3.) * .06); // 밀려난 모래는 보송하게
+  sand = mix(sand, sand * 1.07, cp);                                        // 다져진 면은 살짝 밝게
+
+  float lit = .36 + .9 * diff * shadow;
+  vec3 col = sand * lit * (1. + cav + cav2);
+  col = mix(col * vec3(.82, .86, 1.04), col, shadow);  // 그림자에 푸른 기
+  col *= mix(.88 + .24 * g3, .975 + .05 * g3, cp);
+  col *= mix(.95 + .10 * g4, .99 + .02 * g4, cp);
+  if (g1 > mix(.982, .997, cp)) col *= .72;                                       // 어두운 알갱이
+  if (g2 > .995 && diff > .5) col += vec3(.28, .26, .22) * shadow * (1. - .5 * cp); // 반짝이는 알갱이
+  vec2 q = uv - .5; col *= 1. - dot(q, q) * .35;               // 비네팅
+  o = vec4(col, 1.);
+}`;
+
+function sh(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const aLoc = gl.getAttribLocation(prog, 'a');
+gl.enableVertexAttribArray(aLoc); gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+const U = n => gl.getUniformLocation(prog, n);
+gl.uniform1i(U('uH'), 0); gl.uniform1i(U('uHb'), 1); gl.uniform1i(U('uC'), 2);
+
+function makeTex(unit) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+    [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  return t;
+}
+const texH = makeTex(0), texHb = makeTex(1), texC = makeTex(2);
+
+function setup() {
+  genTerrain();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(U('uTexel'), 1 / W, 1 / H);
+  gl.uniform1f(U('uGrain'), Math.max(1, dpr * 0.9));
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texHb);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, W, H, 0, gl.RED, gl.FLOAT, hb);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texC);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, W, H, 0, gl.RED, gl.UNSIGNED_BYTE, c);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texH);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, W, H, 0, gl.RED, gl.FLOAT, h);
+  rects.dirty = null; flatFrames = 0; strokeId = 0; load = 0;
+  pileIdx.length = pileAmt.length = pileC.length = 0;
+  draw();
+}
+
+function upload() {
+  const r = rects.dirty; if (!r) return false;
+  const w = r.x1 - r.x0 + 1, hh = r.y1 - r.y0 + 1, off = r.y0 * W + r.x0;
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, W);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x0, r.y0, w, hh, gl.RED, gl.UNSIGNED_BYTE, c, off);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, r.x0, r.y0, w, hh, gl.RED, gl.FLOAT, h, off);
+  gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+  rects.dirty = null;
+  return true;
+}
+function draw() { gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
+
+function frame() {
+  if (flatFrames > 0) {
+    for (let i = 0; i < h.length; i++) h[i] += (hInit[i] - h[i]) * 0.12;
+    if (--flatFrames === 0) h.set(hInit);
+    unionRect('dirty', 0, 0, W - 1, H - 1);
+  }
+  if (upload()) draw();
+  requestAnimationFrame(frame);
+}
+
+// ---------- 입력 ----------
+let drawing = false, last = null, dirX = 0, dirY = 0, travel = 0;
+const RELAX_EVERY = 0.75, RELAX_ITERS = 2;   // R*0.75 이동마다 2회 → 한 셀당 약 12회 이완
+const bladeEl = document.getElementById('blade');
+let bladeAng = 0;
+function showBlade(p) {
+  if (tool !== 'rake' || !p) { bladeEl.style.display = 'none'; return; }
+  const B = R * 5;
+  bladeEl.style.display = 'block';
+  bladeEl.style.width = 2 * B + 'px';
+  bladeEl.style.transformOrigin = `${B}px 2px`;
+  bladeEl.style.transform = `translate(${p.x - B}px, ${p.y - 2}px) rotate(${bladeAng}rad)`;
+}
+function toGrid(e) { const b = canvas.getBoundingClientRect(); return { x: e.clientX - b.left, y: e.clientY - b.top }; }
+function segment(p) {
+  const dx = p.x - last.x, dy = p.y - last.y, dist = Math.hypot(dx, dy);
+  if (dist < 0.5) return;
+  const nx = dx / dist, ny = dy / dist;
+  if (tool === 'rake') {
+    if (dirX === 0 && dirY === 0) { dirX = nx; dirY = ny; }
+    const n = Math.ceil(dist);
+    for (let s = 1; s <= n; s++) {
+      dirX = dirX * 0.75 + nx * 0.25; dirY = dirY * 0.75 + ny * 0.25;
+      const l = Math.hypot(dirX, dirY) || 1;
+      bladeStep(last.x + dx * s / n, last.y + dy * s / n, dirX / l, dirY / l);
+    }
+    bladeAng = Math.atan2(dirY, dirX) + Math.PI / 2;
+    last = p;
+    return;
+  }
+  const step = Math.max(0.6, R * 0.2), n = Math.ceil(dist / step);
+  for (let s = 1; s <= n; s++) {
+    dirX = dirX * 0.7 + nx * 0.3; dirY = dirY * 0.7 + ny * 0.3;
+    const l = Math.hypot(dirX, dirY) || 1;
+    const px = last.x + dx * s / n, py = last.y + dy * s / n;
+    stamp(px, py, dirX / l, dirY / l);
+    travel += dist / n;
+    if (travel >= R * RELAX_EVERY) { travel = 0; relaxAround(px, py, RELAX_ITERS); }
+  }
+  last = p;
+}
+canvas.addEventListener('pointerdown', e => {
+  if (flatFrames > 0) return;
+  canvas.setPointerCapture(e.pointerId);
+  drawing = true; last = toGrid(e); dirX = dirY = 0; travel = 0;
+  if (tool === 'rake') { strokeId++; load = 0; }
+  else { stamp(last.x, last.y, 0, 0); relaxAround(last.x, last.y, RELAX_ITERS); }
+  document.getElementById('hint').style.opacity = 0;
+});
+canvas.addEventListener('pointermove', e => {
+  if (drawing) {
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (evs.length ? evs : [e])) segment(toGrid(ev));
+  }
+  showBlade(toGrid(e));
+});
+canvas.addEventListener('pointerleave', () => { if (!drawing) showBlade(null); });
+const end = () => {
+  if (drawing && last) {
+    if (tool === 'rake') finishBlade(last.x, last.y);       // 둔덕은 뗀 자리에 남는다
+    else relaxAround(last.x, last.y, RELAX_ITERS);           // 획 끝도 같은 횟수만큼
+  }
+  drawing = false; last = null;
+};
+canvas.addEventListener('pointerup', end);
+canvas.addEventListener('pointercancel', end);
+
+// ---------- UI ----------
+const seedInput = document.getElementById('seed');
+function useSeed(s) {
+  seed = s >>> 0;
+  seedInput.value = seed;
+  const url = new URL(location.href); url.searchParams.set('seed', seed);
+  history.replaceState(null, '', url);
+  setup();
+}
+function resetTerrain() {
+  if (drawing) return;
+  flatFrames = 40; c.fill(0);
+  canvas.classList.remove('shake'); void canvas.offsetWidth; canvas.classList.add('shake');
+}
+function setTool(t) {
+  tool = t;
+  for (const b of document.querySelectorAll('.seg button')) b.classList.toggle('on', b.dataset.tool === t);
+  if (t !== 'rake') showBlade(null);
+}
+for (const b of document.querySelectorAll('.seg button')) b.onclick = () => setTool(b.dataset.tool);
+document.getElementById('reset').onclick = resetTerrain;
+document.getElementById('newseed').onclick = () => useSeed(Math.floor(Math.random() * 1e6));
+seedInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { const v = parseInt(seedInput.value, 10); if (!isNaN(v)) useSeed(v); seedInput.blur(); }
+});
+document.getElementById('size').oninput = e => { R = +e.target.value; };
+window.addEventListener('keydown', e => {
+  if (e.target === seedInput) return;
+  if (e.code === 'Space' || e.key === 'r' || e.key === 'R') { e.preventDefault(); resetTerrain(); }
+  else if (e.key === 'n' || e.key === 'N') useSeed(Math.floor(Math.random() * 1e6));
+  else if (e.key === '1') setTool('finger');
+  else if (e.key === '2') setTool('rake');
+});
+document.getElementById('save').onclick = () => {
+  draw();
+  canvas.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = `sand-${seed}.png`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+};
+let rt;
+window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(setup, 250); });
+
+const qs = parseInt(new URLSearchParams(location.search).get('seed'), 10);
+useSeed(isNaN(qs) ? Math.floor(Math.random() * 1e6) : qs);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
